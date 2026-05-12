@@ -16,6 +16,19 @@ import { settingsPage, notificationPreviewPage } from './frontend/settings.js';
 import { getSnapshot, increment } from './lib/usage.js';
 import { decrypt } from './lib/crypto.js';
 import { scriptRegistry } from './script-registry.js';
+import { buildScriptEnv, buildLogRedactor } from './queue-consumer.js';
+import { computeNextRun } from './lib/cron.js';
+
+// Constant-time string comparison. Doesn't leak the value byte-by-byte via
+// timing. Length comparison still leaks length, fine for known-length secrets.
+function constantTimeEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
 
 // Re-export Durable Object classes (required by wrangler)
 export { WorkflowLock } from './objects/WorkflowLock.js';
@@ -66,7 +79,7 @@ app.post('/webhooks/:service/:event', async (c) => {
     if (row) expectedSecret = await decrypt(row.encrypted_blob, env.OPS_SECRETS_MASTER_KEY);
   } catch { /* if we can't verify, reject */ }
 
-  if (!expectedSecret || headerSecret !== expectedSecret) {
+  if (!expectedSecret || !constantTimeEquals(headerSecret, expectedSecret)) {
     return c.json({ error: 'Invalid webhook secret' }, 401);
   }
 
@@ -74,9 +87,28 @@ app.post('/webhooks/:service/:event', async (c) => {
   return enqueueWebhook(env, service, event, payload, undefined);
 });
 
-// ── GitHub Actions callback (no auth — run_id is the secret) ─────────────────
+// ── GitHub Actions callback ──────────────────────────────────────────────────
+// Used by external-runtime scripts that run as GitHub Actions jobs. The Action
+// hits this endpoint with the run's outcome. Auth is by a shared secret stored
+// as the worker's CALLBACK_AUTH_SECRET (must also be set in the Action as a
+// repo secret and forwarded as an X-Callback-Secret header).
+//
+// run_id is a UUID, but UUIDs aren't durable secrets — they show up in URLs,
+// logs, and the Copy-for-Claude payload — so they aren't enough on their own.
+const MAX_LOG_OUTPUT_BYTES = 100_000;
 app.post('/api/webhook/github-callback', async (c) => {
   const env = c.env;
+
+  // Verify the shared secret. Fail closed if it isn't configured at all.
+  const callbackSecret = env.CALLBACK_AUTH_SECRET ?? '';
+  if (!callbackSecret) {
+    return c.json({ error: 'Callback endpoint not configured' }, 503);
+  }
+  const provided = c.req.header('X-Callback-Secret') ?? '';
+  if (!provided || !constantTimeEquals(provided, callbackSecret)) {
+    return c.json({ error: 'Invalid callback secret' }, 401);
+  }
+
   const body = await c.req.json<{
     run_id: string;
     status: string;
@@ -85,8 +117,19 @@ app.post('/api/webhook/github-callback', async (c) => {
   }>().catch(() => null);
   if (!body?.run_id) return c.json({ error: 'Missing run_id' }, 400);
 
+  // Cap log_output to keep R2 writes bounded.
+  if (typeof body.log_output === 'string' && body.log_output.length > MAX_LOG_OUTPUT_BYTES) {
+    body.log_output = body.log_output.slice(-MAX_LOG_OUTPUT_BYTES) + '\n…[truncated]';
+  }
+
   const run = await env.DB.prepare('SELECT * FROM runs WHERE id = ?').bind(body.run_id).first<{ id: string; log_r2_key: string | null; status: string }>();
   if (!run) return c.json({ error: 'Run not found' }, 404);
+
+  // Reject callbacks for runs already in a terminal state — prevents replay
+  // attacks that flip a successful run to failed (or vice versa) later.
+  if (run.status === 'success' || run.status === 'failed') {
+    return c.json({ error: 'Run is already in a terminal state', status: run.status }, 409);
+  }
 
   const ghStatus = body.status === 'success' ? 'success' : 'failed';
   const now = new Date().toISOString();
@@ -117,6 +160,28 @@ app.post('/api/webhook/github-callback', async (c) => {
   }
 
   return c.json({ ok: true });
+});
+
+// ── Origin check middleware for state-changing API routes ────────────────────
+// Belt-and-braces against cross-origin form submissions exploiting an active
+// Cloudflare Access session. Same-site cookies and CORS preflight already
+// block most flows; this is a hard backstop. We check on POST/PUT/DELETE/PATCH
+// to `/api/*`; reads (GET) and webhook endpoints are unaffected.
+app.use('/api/*', async (c, next) => {
+  const method = c.req.method;
+  if (method === 'POST' || method === 'PUT' || method === 'DELETE' || method === 'PATCH') {
+    const origin = c.req.header('Origin') ?? '';
+    if (origin) {
+      const expected = `https://${c.env.APP_DOMAIN}`;
+      if (origin !== expected) {
+        return c.json({ error: 'Origin mismatch' }, 403);
+      }
+    }
+    // Origin can be absent for non-browser clients (curl, scripts).
+    // Cloudflare Access still gates the call, so we allow it through.
+  }
+  await next();
+  return;
 });
 
 // ── Auth middleware for all other routes ─────────────────────────────────────
@@ -632,8 +697,16 @@ async function handleQueue(batch: MessageBatch<QueueMessage>, env: Env): Promise
     };
 
     let seq = 0;
+    // Initially a passthrough; replaced with a redactor once secrets are loaded.
+    let redact: (v: unknown) => unknown = (v) => v;
     function log(type: import('./types.js').LogStep['type'], logMessage: string, detail?: unknown): void {
-      runLog.steps.push({ seq: seq++, ts: new Date().toISOString(), type, message: logMessage, detail });
+      runLog.steps.push({
+        seq: seq++,
+        ts: new Date().toISOString(),
+        type,
+        message: typeof redact(logMessage) === 'string' ? (redact(logMessage) as string) : logMessage,
+        detail: detail !== undefined ? redact(detail) : detail,
+      });
     }
 
     const startTime = Date.now();
@@ -656,13 +729,18 @@ async function handleQueue(batch: MessageBatch<QueueMessage>, env: Env): Promise
         }
       }
 
+      // Activate the log redactor now that secret values are known.
+      redact = buildLogRedactor(Object.values(secrets));
+
       const ctx = {
         scriptId: script.id,
         runId: msg.run_id,
         secrets,
         log,
         db: env.DB,
-        env,
+        // Sanitized env — platform secrets are stripped so script code can't
+        // decrypt other secrets or impersonate the platform.
+        env: buildScriptEnv(env),
       };
 
       log('info', `Starting workflow: ${script.name}`, { trigger: msg.trigger_type, run_id: msg.run_id });
@@ -795,47 +873,6 @@ function parseMetadata(meta: unknown): import('./types.js').ScriptMetadata {
     try { return JSON.parse(meta) as import('./types.js').ScriptMetadata; } catch { return {}; }
   }
   return (meta as import('./types.js').ScriptMetadata) ?? {};
-}
-
-function computeNextRun(cron: string): string | null {
-  try {
-    const parts = cron.trim().split(/\s+/);
-    if (parts.length !== 5) return null;
-    const [minPart, hourPart, , , dowPart] = parts;
-
-    const next = new Date();
-    next.setSeconds(0);
-    next.setMilliseconds(0);
-    next.setMinutes(next.getMinutes() + 1);
-
-    for (let i = 0; i < 10080; i++) {
-      const dow = next.getUTCDay();
-      const hour = next.getUTCHours();
-      const min = next.getUTCMinutes();
-
-      if (matchesCronPart(dowPart, dow) && matchesCronPart(hourPart, hour) && matchesCronPart(minPart, min)) {
-        return next.toISOString();
-      }
-      next.setMinutes(next.getMinutes() + 1);
-    }
-    return null;
-  } catch { return null; }
-}
-
-function matchesCronPart(part: string, value: number): boolean {
-  if (part === '*') return true;
-  if (part.startsWith('*/')) return value % parseInt(part.slice(2), 10) === 0;
-  // Range+step: e.g. "9-17/2" means every 2 units from 9 to 17
-  if (part.includes('-') && part.includes('/')) {
-    const [range, stepStr] = part.split('/');
-    const [lo, hi] = range.split('-').map(Number);
-    const step = parseInt(stepStr, 10);
-    if (value < lo || value > hi) return false;
-    return (value - lo) % step === 0;
-  }
-  if (part.includes('-')) { const [lo, hi] = part.split('-').map(Number); return value >= lo && value <= hi; }
-  if (part.includes(',')) return part.split(',').map(Number).includes(value);
-  return parseInt(part, 10) === value;
 }
 
 async function fetchScriptFiles(env: Env, scriptId: string, ref: string): Promise<Record<string, string>> {

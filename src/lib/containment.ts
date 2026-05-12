@@ -39,6 +39,12 @@ const EXFILTRATION_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: 'require() call (not allowed in Workers)', re: /\brequire\s*\(/ },
   { name: 'dynamic import of external URL', re: /import\s*\(\s*['"`]https?:\/\// },
   { name: 'base64 decode of secrets', re: /atob\s*\(\s*(?:env|context)\./i },
+  // Scripts should only import their own ../../src/queue-consumer.js for the
+  // WorkflowContext type. Blocking imports from src/api, src/lib, src/objects,
+  // and src/types prevents pasteback scripts from pulling in platform internals
+  // (e.g. the decrypt helper) to bypass the secret-scoping model.
+  { name: 'import of platform internals',
+    re: /from\s+['"](?:\.\.\/)+src\/(?:api|lib|objects|index|types|script-registry|skill-content|scheduler)\b/ },
 ];
 
 const KNOWN_SECRET_PATTERNS = [

@@ -3,6 +3,7 @@ import type { Env, Script, Run, QueueMessage } from '../types.js';
 import { requireAuth, getUser } from './auth.js';
 import { increment } from '../lib/usage.js';
 import { buildEditPayload } from '../lib/payload.js';
+import { computeNextRun, isValidCron } from '../lib/cron.js';
 
 export const workflowsRouter = new Hono<{ Bindings: Env }>();
 
@@ -157,7 +158,19 @@ workflowsRouter.put('/:id/schedule', async (c) => {
   const script = await env.DB.prepare('SELECT id FROM scripts WHERE id = ?').bind(id).first<{ id: string }>();
   if (!script) return c.json({ error: 'Workflow not found' }, 404);
 
+  // Reject unparseable cron up front so the schedule isn't silently
+  // disabled by a NULL next_run_at.
+  if (body.cron_expression && !isValidCron(body.cron_expression)) {
+    return c.json({
+      error: "That cron expression isn't supported. Use 5-field syntax (minute hour day month weekday); supported tokens are *, N, N-M, N,M,O, */N, and N-M/S.",
+    }, 400);
+  }
   const nextRunAt = body.cron_expression ? computeNextRun(body.cron_expression) : null;
+  if (body.cron_expression && !nextRunAt) {
+    return c.json({
+      error: "That cron expression doesn't fire within the next week. Double-check the values.",
+    }, 400);
+  }
 
   // Upsert schedule
   await env.DB.prepare(`
@@ -250,55 +263,6 @@ workflowsRouter.get('/:id/runs', async (c) => {
     totalPages: Math.ceil((total?.cnt ?? 0) / limit),
   });
 });
-
-// ── Helper: compute next run from cron ──────────────────────────────────────
-function computeNextRun(cron: string): string | null {
-  try {
-    const parts = cron.trim().split(/\s+/);
-    if (parts.length !== 5) return null;
-    const [minPart, hourPart, , , dowPart] = parts;
-
-    const now = new Date();
-    const next = new Date(now);
-    next.setSeconds(0);
-    next.setMilliseconds(0);
-    next.setMinutes(next.getMinutes() + 1); // start from next minute
-
-    // Try up to 1 week ahead
-    for (let i = 0; i < 10080; i++) {
-      const dow = next.getUTCDay(); // 0=Sun
-      const hour = next.getUTCHours();
-      const min = next.getUTCMinutes();
-
-      if (matchesCronPart(dowPart, dow) &&
-          matchesCronPart(hourPart, hour) &&
-          matchesCronPart(minPart, min)) {
-        return next.toISOString();
-      }
-
-      next.setMinutes(next.getMinutes() + 1);
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function matchesCronPart(part: string, value: number): boolean {
-  if (part === '*') return true;
-  if (part.startsWith('*/')) {
-    const step = parseInt(part.slice(2), 10);
-    return value % step === 0;
-  }
-  if (part.includes('-')) {
-    const [lo, hi] = part.split('-').map(Number);
-    return value >= lo && value <= hi;
-  }
-  if (part.includes(',')) {
-    return part.split(',').map(Number).includes(value);
-  }
-  return parseInt(part, 10) === value;
-}
 
 // ── Helper: fetch script source files from GitHub ───────────────────────────
 async function fetchScriptFilesFromGitHub(env: Env, scriptId: string, ref: string): Promise<Record<string, string>> {

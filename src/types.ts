@@ -36,6 +36,10 @@ export interface Env {
   GITHUB_APP_ID: string;
   GITHUB_INSTALLATION_ID: string;
   RESEND_API_KEY: string;
+  // Required if you use external-runtime scripts that POST back to
+  // /api/webhook/github-callback. The callback must include this value
+  // in the X-Callback-Secret header.
+  CALLBACK_AUTH_SECRET: string;
 }
 
 export type Runtime = 'worker' | 'workflow' | 'external';

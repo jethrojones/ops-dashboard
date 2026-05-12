@@ -116,8 +116,16 @@ crons = ["*/1 5-23 * * *"]
 #   RESEND_API_KEY           — Resend API key for failure emails. Without
 #                              it, emails are skipped silently.
 #
+# Optional (only if you use external-runtime scripts that GitHub Actions
+# calls back to /api/webhook/github-callback):
+#   CALLBACK_AUTH_SECRET     — random string; the GitHub Action must send
+#                              it as the X-Callback-Secret header.
+#                              Without this set, the callback endpoint
+#                              returns 503.
+#
 # Set with:
 #   npx wrangler secret put OPS_SECRETS_MASTER_KEY
 #   npx wrangler secret put CF_ACCESS_AUD
 #   npx wrangler secret put GITHUB_PAT
 #   npx wrangler secret put RESEND_API_KEY
+#   npx wrangler secret put CALLBACK_AUTH_SECRET

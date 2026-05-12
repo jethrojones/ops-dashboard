@@ -58,6 +58,14 @@ runsRouter.delete('/:id', async (c) => {
   const run = await env.DB.prepare('SELECT log_r2_key FROM runs WHERE id = ?').bind(id).first<{ log_r2_key: string | null }>();
   if (!run) return c.json({ error: 'Run not found' }, 404);
 
+  // Best-effort R2 cleanup before deleting the D1 row. Both the verbose log
+  // and the cached Copy-for-Claude debug payload can contain operational
+  // detail that should go away when the user clears the run.
+  if (env.LOGS) {
+    if (run.log_r2_key) await env.LOGS.delete(run.log_r2_key).catch(() => {});
+    await env.LOGS.delete(`runs/${id}-debug.json`).catch(() => {});
+  }
+
   await env.DB.prepare('DELETE FROM runs WHERE id = ?').bind(id).run();
   await increment(env, 'd1_writes');
 
@@ -71,6 +79,20 @@ runsRouter.delete('/', async (c) => {
   if (status !== 'failed' && status !== 'skipped') {
     return c.json({ error: 'Only ?status=failed or ?status=skipped allowed' }, 400);
   }
+
+  // Best-effort R2 cleanup before bulk D1 delete. Capped to keep the
+  // subrequest budget bounded; remaining R2 objects are pruned on the next
+  // clear-all click (or by hand).
+  if (env.LOGS) {
+    const rows = await env.DB.prepare(
+      'SELECT id, log_r2_key FROM runs WHERE status = ? LIMIT 40'
+    ).bind(status).all<{ id: string; log_r2_key: string | null }>();
+    for (const row of rows.results ?? []) {
+      if (row.log_r2_key) await env.LOGS.delete(row.log_r2_key).catch(() => {});
+      await env.LOGS.delete(`runs/${row.id}-debug.json`).catch(() => {});
+    }
+  }
+
   const result = await env.DB.prepare('DELETE FROM runs WHERE status = ?').bind(status).run();
   await increment(env, 'd1_writes');
   return c.json({ ok: true, deleted: result.meta?.changes ?? 0 });
