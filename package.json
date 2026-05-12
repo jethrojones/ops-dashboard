@@ -1,0 +1,26 @@
+{
+  "name": "ops-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted ops console on Cloudflare Workers — schedule and run automations, manage encrypted API keys, view logs, get failure emails.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "wrangler d1 migrations apply ops-dashboard --remote",
+    "db:migrate:local": "wrangler d1 migrations apply ops-dashboard --local"
+  },
+  "dependencies": {
+    "hono": "^4.7.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241224.0",
+    "@vitest/coverage-v8": "^2.1.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "wrangler": "^4.87.0"
+  }
+}

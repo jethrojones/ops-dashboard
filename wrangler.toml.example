@@ -1,0 +1,123 @@
+# Copy this file to `wrangler.toml` and fill in the placeholder values.
+# `wrangler.toml` is gitignored so your account ID and resource IDs don't leak.
+
+name = "ops-dashboard"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Your Cloudflare account ID. Find it: dash.cloudflare.com → right sidebar.
+account_id = "REPLACE_WITH_YOUR_CLOUDFLARE_ACCOUNT_ID"
+
+# ─── Environment variables (visible at runtime via env.*) ────────────────────
+[vars]
+# The domain Cloudflare Access protects this worker at. Used in failure emails.
+APP_DOMAIN = "ops.example.com"
+# Cloudflare Access "team domain" subdomain (without the .cloudflareaccess.com).
+CF_TEAM_DOMAIN = "your-team-name"
+# Verified Resend sender address (must be on a domain you own + verified in Resend).
+RESEND_FROM_EMAIL = "ops@example.com"
+# Comma-separated fallback list of failure-email recipients. The Settings UI
+# overrides this once anyone toggles a recipient on.
+NOTIFY_EMAILS = ""
+# GitHub repo containing this code (used by the paste-back deploy flow + the
+# Copy-for-Claude payload, which links to the source file at the failing SHA).
+GITHUB_REPO_OWNER = "your-github-username"
+GITHUB_REPO_NAME  = "ops-dashboard"
+GITHUB_SCRIPTS_PATH = "scripts"
+# Timezone shown in failure emails / log timestamps.
+SCHEDULER_TZ = "America/New_York"
+
+# Free-tier daily limits used by the circuit breaker. Adjust if you're on
+# Workers Paid — the platform caps are: requests 10M/day, D1 writes 50M/day,
+# KV writes 1k/day (free) or unlimited (paid), queue ops 10k/day, R2 class A
+# 1M/month. The breaker trips at 95% of any of these.
+FREE_WORKER_REQUESTS_DAY = "100000"
+FREE_D1_WRITES_DAY       = "100000"
+FREE_KV_WRITES_DAY       = "1000"
+FREE_QUEUE_OPS_DAY       = "10000"
+FREE_R2_CLASS_A_MONTH    = "1000000"
+
+# ─── D1 database ─────────────────────────────────────────────────────────────
+# Create with: npx wrangler d1 create ops-dashboard
+# Then paste the database_id printed in the output below.
+[[d1_databases]]
+binding       = "DB"
+database_name = "ops-dashboard"
+database_id   = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# ─── R2 bucket for verbose run logs ──────────────────────────────────────────
+# Optional but recommended. Create with:
+#   npx wrangler r2 bucket create ops-dashboard-logs
+# If you skip this, runs still complete but verbose logs are not retained.
+[[r2_buckets]]
+binding     = "LOGS"
+bucket_name = "ops-dashboard-logs"
+
+# ─── KV namespace for cached values (CF Access JWKs, connection status) ──────
+# Create with: npx wrangler kv namespace create CACHE
+[[kv_namespaces]]
+binding = "CACHE"
+id      = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# ─── Durable Objects ─────────────────────────────────────────────────────────
+[[durable_objects.bindings]]
+name        = "WORKFLOW_LOCK"
+class_name  = "WorkflowLock"
+
+[[durable_objects.bindings]]
+name        = "USAGE_COUNTER"
+class_name  = "UsageCounter"
+
+[[durable_objects.bindings]]
+name        = "WEBHOOK_DEDUP"
+class_name  = "WebhookDedup"
+
+# Register the SQLite-backed DO classes with the platform on first deploy.
+[[migrations]]
+tag                = "v1"
+new_sqlite_classes = ["WorkflowLock", "UsageCounter", "WebhookDedup"]
+
+# ─── Queue ───────────────────────────────────────────────────────────────────
+# Create with: npx wrangler queues create ops-dashboard-dispatch
+[[queues.producers]]
+binding = "DISPATCH_QUEUE"
+queue   = "ops-dashboard-dispatch"
+
+[[queues.consumers]]
+queue              = "ops-dashboard-dispatch"
+max_batch_size     = 1
+max_batch_timeout  = 5
+max_retries        = 3
+
+# ─── Cron triggers ───────────────────────────────────────────────────────────
+# The worker scheduler ticks every minute during this window and looks for
+# due workflows. Widen it (e.g. "*/1 * * * *") if you need 24-hour coverage.
+[triggers]
+crons = ["*/1 5-23 * * *"]
+
+# ─── Secrets — set via `wrangler secret put <NAME>` (not in this file) ───────
+#
+# Required:
+#   OPS_SECRETS_MASTER_KEY   — base64-encoded 32-byte AES-GCM key used to
+#                              encrypt the per-service API keys in D1.
+#                              Generate one with:
+#                                node -e "console.log(crypto.getRandomValues(new Uint8Array(32)).reduce((s,b)=>s+String.fromCharCode(b),'')).toString('base64')"
+#                              or:
+#                                openssl rand -base64 32
+#   CF_ACCESS_AUD            — the "AUD tag" of your Cloudflare Access app
+#                              that fronts this worker (from the Zero Trust
+#                              dashboard).
+#
+# Optional (only if you use the paste-back deploy flow):
+#   GITHUB_PAT               — Personal Access Token (classic, scopes:
+#                              repo + workflow) used to open PRs from
+#                              paste-backs.
+#   RESEND_API_KEY           — Resend API key for failure emails. Without
+#                              it, emails are skipped silently.
+#
+# Set with:
+#   npx wrangler secret put OPS_SECRETS_MASTER_KEY
+#   npx wrangler secret put CF_ACCESS_AUD
+#   npx wrangler secret put GITHUB_PAT
+#   npx wrangler secret put RESEND_API_KEY

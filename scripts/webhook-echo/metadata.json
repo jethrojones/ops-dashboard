@@ -1,0 +1,13 @@
+{
+  "id": "webhook-echo",
+  "name": "Webhook Echo",
+  "description": "Receives a webhook at /webhooks/echo/ping and logs the payload. Use it to test webhook routing before wiring up a real third-party service.",
+  "runtime": "worker",
+  "enabled": true,
+  "required_secrets": ["echo_webhook_secret"],
+  "triggers": [
+    { "type": "webhook", "service": "echo", "event": "ping", "enabled": true },
+    { "type": "manual", "enabled": true }
+  ],
+  "params_schema": []
+}

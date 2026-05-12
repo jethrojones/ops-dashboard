@@ -1,0 +1,29 @@
+{
+  "id": "hello-world",
+  "name": "Hello World",
+  "description": "Smallest possible workflow. Logs a greeting. Use it to verify the platform is wired up correctly before adding real automations.",
+  "runtime": "worker",
+  "default_schedule": "0 9 * * 1-5",
+  "business_hours_only": false,
+  "required_secrets": [],
+  "triggers": [
+    { "type": "cron", "enabled": true },
+    { "type": "manual", "enabled": true }
+  ],
+  "params_schema": [
+    {
+      "key": "dry_run",
+      "label": "Dry run",
+      "type": "boolean",
+      "default": true,
+      "description": "If true, do not actually do anything. (For hello-world there's nothing to skip, but every real script should honor this flag.)"
+    },
+    {
+      "key": "name",
+      "label": "Name to greet",
+      "type": "string",
+      "default": "world",
+      "description": "Demonstrates passing a string param from the Run-now modal into the script."
+    }
+  ]
+}
